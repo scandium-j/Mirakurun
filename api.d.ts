@@ -269,8 +269,44 @@ export interface RemoteMirakurun {
     port?: number;
 }
 
+export type RemoteCheckState = "unknown" | "online" | "suspect" | "offline" | "error";
+
+export interface RemoteDirectionStatus {
+    state: RemoteCheckState | "stale";
+    checkedAt: number | null;
+    lastSuccess: number | null;
+    failures: number;
+    error: string | null;
+}
+
+/** Raw outgoing check result, independent of the combined connection state. */
+export interface RemoteHealthObservation {
+    instanceId: string;
+    sequence: number;
+    ageMs: number;
+    successAgeMs: number | null;
+    state: RemoteCheckState;
+    failures: number;
+    error: string | null;
+}
+
+export interface RemoteHealth {
+    protocol: number;
+    enabled: boolean;
+    registered: boolean;
+    role?: "parent" | "child";
+    checkedAt: number | null;
+    lastSuccess: number | null;
+    state: RemoteCheckState;
+    observation?: RemoteHealthObservation;
+    recovery: RemoteRecoveryStatus;
+    lastRequest?: { id: string; stage: string; at: number };
+}
+
 export interface RemotePeerStatus extends RemoteMirakurun {
-    state: "unknown" | "online" | "suspect" | "offline" | "error";
+    state: RemoteCheckState;
+    connectionState?: "online" | "outgoing-error" | "incoming-error" | "both-error" | "unknown" | "stale" | "error";
+    reverse?: RemoteDirectionStatus;
     checkedAt: number | null;
     lastSuccess: number | null;
     inboundAt: number | null;

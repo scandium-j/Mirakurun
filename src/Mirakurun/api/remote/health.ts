@@ -12,5 +12,5 @@ import manager from "../../remote/RemoteManager";
 export const get: Operation = async (req, res) => api.responseJSON(res, await manager.health(req.ip));
 get.apiDoc = {
     tags: ["remote"], operationId: "getRemoteHealth",
-    responses: { 200: { description: "Peer health without tuning", schema: { type: "object" } } }
+    responses: { 200: { description: "Peer health without tuning", schema: { $ref: "#/definitions/RemoteHealth" } } }
 };

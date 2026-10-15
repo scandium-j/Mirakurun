@@ -14,7 +14,16 @@ import { state } from "../modules/state";
 import "./RemoteSection.sass";
 
 const labels = { unknown: "未確認", online: "正常", suspect: "再確認中", offline: "応答なし", error: "設定エラー",
-    idle: "未使用", starting: "開始待ち", receiving: "受信中", failed: "失敗" };
+    stale: "結果が古い", idle: "未使用", starting: "開始待ち", receiving: "受信中", failed: "失敗" };
+const connectionLabels = {
+    online: "双方向: 正常",
+    "outgoing-error": "接続: 自分→相手に異常",
+    "incoming-error": "接続: 相手→自分に異常",
+    "both-error": "接続: 双方向に異常",
+    unknown: "接続: 未確認",
+    stale: "接続: 結果が古い",
+    error: "接続: 設定エラー"
+};
 const time = (value?: number) => value ? DateTime.fromMillis(value).setZone("Asia/Tokyo").setLocale("ja").toFormat("MM/dd HH:mm:ss") : "未確認";
 
 async function json(url: string, method = "GET", body?: unknown, signal?: AbortSignal) {
@@ -109,7 +118,15 @@ export const RemoteSection: React.FC = () => {
         {status?.peers.map(peer => <div className="remote-machine" key={peer.id}>
             <div className="remote-toolbar">
                 <strong>{peer.name}</strong><Tag>{peer.role === "child" ? "子機" : "親機"}</Tag>
-                <Tag intent={peer.state === "online" ? "success" : peer.state === "offline" || peer.state === "error" ? "danger" : "none"}>API: {labels[peer.state]}</Tag>
+                <Tag intent={peer.connectionState === "online" ? "success" : peer.connectionState === "error" || peer.connectionState === "outgoing-error" || peer.connectionState === "incoming-error" || peer.connectionState === "both-error" ? "danger" : peer.connectionState === "stale" ? "warning" : "none"}>
+                    {connectionLabels[peer.connectionState || "unknown"]}
+                </Tag>
+                <Tag intent={peer.state === "online" ? "success" : peer.state === "offline" || peer.state === "error" ? "danger" : "none"}>
+                    自分→相手: {labels[peer.state]}
+                </Tag>
+                <Tag intent={peer.reverse?.state === "online" ? "success" : peer.reverse?.state === "offline" || peer.reverse?.state === "error" ? "danger" : peer.reverse?.state === "stale" ? "warning" : "none"}>
+                    相手→自分: {labels[peer.reverse?.state || "unknown"]}
+                </Tag>
                 {peer.role === "child" && <Tag>配信: {labels[peer.streamState]}</Tag>}
                 <Button small icon="refresh" loading={checking === peer.id} disabled={!status.enabled || !status.canManage || !!checking}
                     onClick={() => check(peer.id)}>今すぐ確認</Button>
@@ -119,7 +136,9 @@ export const RemoteSection: React.FC = () => {
             {(peer.error || peer.streamError) && <Callout intent="warning">{peer.error}{peer.error && peer.streamError && <br />}{peer.streamError}</Callout>}
             <details>
                 <summary>詳細・再起動履歴</summary>
-                <p>最終確認: {time(peer.checkedAt)} ／ 連続失敗: {peer.failures}回 ／ ping: {peer.ping}</p>
+                <p>自分→相手 API: {labels[peer.state]} ／ 最終確認: {time(peer.checkedAt)} ／ 連続失敗: {peer.failures}回 ／ ping: {peer.ping}</p>
+                <p>相手→自分: {labels[peer.reverse?.state || "unknown"]} ／ 最終確認: {time(peer.reverse?.checkedAt)} ／ 最終成功: {time(peer.reverse?.lastSuccess)} ／ 連続失敗: {peer.reverse ? `${peer.reverse.failures}回` : "未確認"}</p>
+                {peer.reverse?.error && <Callout intent="warning">相手→自分: {peer.reverse.error}</Callout>}
                 <p>復旧処理: {peer.recovery || "待機中"}</p>
                 {peer.lastRequest && <p>子機の要求記録: {peer.lastRequest.stage} / {time(peer.lastRequest.at)} / {peer.lastRequest.id}</p>}
                 {peer.remoteRecovery && <>
@@ -135,7 +154,7 @@ export const RemoteSection: React.FC = () => {
             <summary>このマシンの自動再起動</summary>
             <p>{status.recovery.enabled ? "ON" : "OFF"} ／ 同一障害: {status.recovery.incidentAttempts}/2回
                 {status.recovery.blocked && " ／ 上限到達・停止中"}
-                {!status.recovery.supported && " ／ Windowsサービス起動時のみ対応"}</p>
+                {!status.recovery.supported && " ／ Windowsサービス／systemd起動時のみ対応"}</p>
             {status.recovery.error && <Callout intent="danger">{status.recovery.error}</Callout>}
             <ul>{status.recovery.history.map((entry, i) => <li key={i}>{time(entry.at)} {entry.reason}</li>)}</ul>
             <Button disabled={!status.canManage || status.recovery.incidentAttempts === 0} onClick={() => setResetOpen(true)}>障害ごとの回数制限を解除</Button>
@@ -174,9 +193,9 @@ export const RemoteSection: React.FC = () => {
                         id: "", name: "", role: "child", host: "", port: 40772
                     }] })}>マシンを追加</Button>
                     <hr />
-                    <Switch checked={editing.remoteAutoRestart ?? false} label="子機として配信開始に失敗したとき、このMirakurunの自動再起動を許可する"
+                    <Switch checked={editing.remoteAutoRestart ?? false} label="子機として配信開始に失敗したときや、親機からのAPI通信異常が続くとき、このMirakurunの自動再起動を許可する"
                         onChange={e => setEditing({ ...editing, remoteAutoRestart: e.currentTarget.checked })} />
-                    <p>Windowsサービス起動時のみ。起動後2分待機、再起動間隔10分、同一障害2回・1時間2回まで。ほかの録画・視聴中は保留します。</p>
+                    <p>Windowsサービス／systemdから起動している場合に対応。起動後2分待機、再起動間隔10分、同一障害2回・1時間2回まで。ほかの録画・視聴中は保留します。</p>
                     <FormGroup label="Discord Webhook（親機側の通知）" helperText={editing.remoteDiscordWebhookConfigured ? "登録済み。空欄のままなら現在のURLを維持します。" : "空欄なら通知しません。"}>
                         <InputGroup type="password" autoComplete="off" value={webhook} onChange={e => setWebhook(e.target.value)} disabled={clearWebhook} />
                     </FormGroup>

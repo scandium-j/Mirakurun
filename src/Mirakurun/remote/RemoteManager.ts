@@ -6,12 +6,14 @@
  * Distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND.
  */
 import * as path from "path";
-import { ConfigServer, RemoteMirakurun, RemotePeerStatus, RemoteStatus } from "../../../api";
+import { randomUUID } from "crypto";
+import { ConfigServer, RemoteMirakurun, RemotePeerStatus, RemoteStatus, RemoteDirectionStatus, RemoteHealthObservation, RemoteHealth } from "../../../api";
 import _ from "../_";
 import * as log from "../log";
 import { hostAddresses, normalizeIP, pingHost, requestJSON } from "./network";
 import { Recovery } from "./Recovery";
 import { canRestartService, restartService } from "../service-process";
+import { isPermittedIPAddress } from "../system";
 
 interface Peer extends RemotePeerStatus {
     pending?: Promise<void>;
@@ -23,6 +25,12 @@ interface Peer extends RemotePeerStatus {
     graceUntil: number;
     recovering: boolean;
     lastRecoveryRequest: number;
+    resultAt?: number;
+    sequence: number;
+    observation?: RemoteHealthObservation;
+    observationReceivedAt?: number;
+    reverseEvidence: { instanceId: string; sequence: number; at: number }[];
+    reverseHealthySince?: number;
 }
 interface Incoming {
     ip: string;
@@ -37,6 +45,8 @@ interface Incoming {
 }
 
 export class RemoteManager {
+    private static readonly RESULT_FRESHNESS = 360000;
+    private static readonly FAILURE_FRESHNESS = 60000;
     private peers = new Map<string, Peer>();
     private incoming = new Map<string, Incoming>();
     private streams = new Map<string, { peer: string; state: string; error?: string }>();
@@ -48,6 +58,8 @@ export class RemoteManager {
     private notificationError: string = null;
     private notificationQueue: Promise<void> = Promise.resolve();
     private started = false;
+    private startedAt = 0;
+    private instanceId: string;
 
     constructor(
         private config: () => ConfigServer = () => _.config.server || { allowOrigins: [], allowPNA: false, tsplayEndpoint: "" },
@@ -63,6 +75,8 @@ export class RemoteManager {
             return;
         }
         this.started = true;
+        this.startedAt = this.now();
+        this.instanceId = randomUUID();
         this.controller = new AbortController();
         this.recovery = new Recovery(path.resolve(path.dirname(process.env.SERVER_CONFIG_PATH || "data/config/server.yml"),
             "../remote/recovery.json"), this.now);
@@ -71,7 +85,8 @@ export class RemoteManager {
                 ...config, state: "unknown", checkedAt: null, lastSuccess: null, inboundAt: null,
                 failures: 0, error: null, ping: "unknown", streamState: "idle", streamError: null,
                 recovery: "", nextCheck: 0, attempts: [], lastFailureCount: 0, alert: false,
-                limitAlert: false, graceUntil: 0, recovering: false, lastRecoveryRequest: 0
+                limitAlert: false, graceUntil: 0, recovering: false, lastRecoveryRequest: 0,
+                sequence: 0, reverseEvidence: []
             });
         }
         if (this.config().remoteManagementEnabled) {
@@ -99,8 +114,11 @@ export class RemoteManager {
         return {
             enabled: this.config().remoteManagementEnabled === true,
             peers: [...this.peers.values()].map(peer => {
-                const { pending, nextCheck, attempts, lastFailureCount, alert, limitAlert, graceUntil, recovering, lastRecoveryRequest, ...visible } = peer;
-                return visible;
+                const { pending, nextCheck, attempts, lastFailureCount, alert, limitAlert, graceUntil, recovering,
+                    lastRecoveryRequest, resultAt, sequence, observation, observationReceivedAt,
+                    reverseEvidence, reverseHealthySince, ...visible } = peer;
+                const reverse = this.reverseStatus(peer);
+                return { ...visible, reverse, connectionState: this.connectionState(peer, reverse) };
             }),
             recovery: this.recoveryStatus(), notificationError: this.notificationError
         };
@@ -122,7 +140,7 @@ export class RemoteManager {
         return peer.pending;
     }
 
-    async health(ip: string) {
+    async health(ip: string): Promise<RemoteHealth> {
         const peer = await this.identify(ip);
         if (peer) {
             peer.inboundAt = this.now();
@@ -131,6 +149,12 @@ export class RemoteManager {
             protocol: 1, enabled: this.config().remoteManagementEnabled === true,
             registered: !!peer, role: peer?.role, checkedAt: peer?.checkedAt || null,
             lastSuccess: peer?.lastSuccess || null, state: peer?.state || "unknown",
+            observation: peer?.resultAt === undefined ? undefined : {
+                instanceId: this.instanceId, sequence: peer.sequence,
+                ageMs: Math.max(0, this.now() - peer.resultAt),
+                successAgeMs: peer.lastSuccess === null ? null : Math.max(0, this.now() - peer.lastSuccess),
+                state: peer.state, failures: peer.failures, error: peer.error
+            },
             recovery: this.recoveryStatus(),
             lastRequest: [...this.incoming.entries()].filter(([id, item]) => item.ip === normalizeIP(ip))
                 .map(([id, item]) => ({ id, stage: item.stage, at: item.at })).sort((a, b) => b.at - a.at)[0]
@@ -255,25 +279,7 @@ export class RemoteManager {
         if (this.hasActiveStream()) {
             throw new Error("録画・視聴が継続中のため再起動を保留しています");
         }
-        this.recovery.ensureAvailable();
-        peer.recovery = "再起動待ち";
-        this.restartTimer = setTimeout(() => {
-            this.restartTimer = undefined;
-            if (!this.started) {
-                return;
-            }
-            if (this.hasActiveStream()) {
-                peer.recovery = "録画・視聴が開始されたため再起動を保留しています";
-                return;
-            }
-            try {
-                this.recovery.reserve(`remote配信開始失敗: ${peer.name}`, records.map(item => item.subject));
-                this.restart();
-            } catch (error) {
-                peer.recovery = error.message;
-                log.warn("Remote automatic restart was deferred: %s", error.message);
-            }
-        }, 1000);
+        this.scheduleRestart(peer, `remote配信開始失敗: ${peer.name}`, records.map(item => item.subject));
         return "再起動を受け付けました";
     }
 
@@ -290,6 +296,161 @@ export class RemoteManager {
         return this.recovery?.status(this.config().remoteAutoRestart === true, this.restartSupported()) || {
             enabled: false, supported: false, blocked: false, incidentAttempts: 0, nextAllowedAt: 0, history: []
         };
+    }
+
+    private reverseStatus(peer: Peer): RemoteDirectionStatus {
+        const observation = peer.observation;
+        if (!observation) {
+            return { state: "unknown", checkedAt: null, lastSuccess: null, failures: 0, error: null };
+        }
+        // Use durations to avoid depending on synchronized clocks between machines.
+        const age = observation.ageMs + Math.max(0, this.now() - peer.observationReceivedAt);
+        return {
+            state: age > RemoteManager.RESULT_FRESHNESS ? "stale" : observation.state,
+            checkedAt: peer.observationReceivedAt - observation.ageMs,
+            lastSuccess: observation.successAgeMs === null ? null : peer.observationReceivedAt - observation.successAgeMs,
+            failures: observation.failures, error: observation.error
+        };
+    }
+
+    private connectionState(peer: Peer, reverse: RemoteDirectionStatus): RemotePeerStatus["connectionState"] {
+        const outgoing = peer.resultAt !== undefined && this.now() - peer.resultAt > RemoteManager.RESULT_FRESHNESS ? "stale" : peer.state;
+        if (outgoing === "error" || (outgoing === "online" && peer.error) || reverse.state === "error" ||
+            (reverse.state === "online" && reverse.error)) {
+            return "error";
+        }
+        const outgoingFailed = outgoing === "offline" || outgoing === "suspect";
+        const incomingFailed = reverse.state === "offline" || reverse.state === "suspect";
+        if (outgoingFailed || incomingFailed) {
+            return outgoingFailed && incomingFailed ? "both-error" : outgoingFailed ? "outgoing-error" : "incoming-error";
+        }
+        if (reverse.state === "stale" || outgoing === "stale") {
+            return "stale";
+        }
+        return outgoing === "online" && reverse.state === "online" ? "online" : "unknown";
+    }
+
+    private observeReverse(peer: Peer, health: any): boolean {
+        const result: RemoteHealthObservation = health.observation;
+        if (peer.error || !result || !/^[a-f0-9-]{36}$/.test(result.instanceId || "") ||
+            !Number.isSafeInteger(result.sequence) || result.sequence < 1 ||
+            !Number.isSafeInteger(result.ageMs) || result.ageMs < 0 ||
+            (result.successAgeMs !== null && (!Number.isSafeInteger(result.successAgeMs) || result.successAgeMs < 0)) ||
+            (result.successAgeMs !== null && result.successAgeMs < result.ageMs) ||
+            !["unknown", "online", "suspect", "offline", "error"].includes(result.state) ||
+            !Number.isSafeInteger(result.failures) || result.failures < 0 ||
+            (result.error !== null && (typeof result.error !== "string" || result.error.length > 1000))) {
+            peer.observation = undefined;
+            peer.reverseEvidence = [];
+            peer.reverseHealthySince = undefined;
+            return false;
+        }
+        const previous = peer.observation;
+        if (previous?.instanceId === result.instanceId && result.sequence <= previous.sequence) {
+            // Repeated/cached results neither become fresh again nor count as new failures.
+            return false;
+        }
+        if (previous?.instanceId !== result.instanceId ||
+            previous.ageMs + this.now() - peer.observationReceivedAt > RemoteManager.RESULT_FRESHNESS) {
+            peer.reverseEvidence = [];
+            peer.reverseHealthySince = undefined;
+        }
+        peer.observation = { ...result };
+        peer.observationReceivedAt = this.now();
+        if (result.state === "online" && !result.error && result.ageMs <= RemoteManager.RESULT_FRESHNESS) {
+            peer.reverseEvidence = [];
+            peer.reverseHealthySince ??= this.now();
+            if (this.now() - peer.reverseHealthySince >= 60000) {
+                try {
+                    this.recovery?.recovered(`api:${peer.id}`);
+                } catch (_) {
+                    log.warn("Remote recovery state could not be saved");
+                }
+            }
+        } else {
+            peer.reverseHealthySince = undefined;
+            if (this.reverseFailure(peer)) {
+                peer.reverseEvidence = peer.reverseEvidence.filter(item => this.now() - item.at <= 120000);
+                const last = peer.reverseEvidence[peer.reverseEvidence.length - 1];
+                if (!last || this.now() - last.at >= 25000) {
+                    peer.reverseEvidence.push({ instanceId: result.instanceId, sequence: result.sequence, at: this.now() });
+                    peer.reverseEvidence = peer.reverseEvidence.slice(-3);
+                }
+            } else {
+                peer.reverseEvidence = [];
+            }
+        }
+        return true;
+    }
+
+    private reverseFailure(peer: Peer): boolean {
+        const result = peer.observation;
+        const age = result ? result.ageMs + Math.max(0, this.now() - peer.observationReceivedAt) : Infinity;
+        return peer.role === "parent" && peer.state === "online" && !peer.error &&
+            peer.lastSuccess !== null && this.now() - peer.lastSuccess <= 30000 &&
+            result?.state === "offline" && result.failures >= 3 &&
+            age <= RemoteManager.FAILURE_FRESHNESS && age <= this.now() - this.startedAt &&
+            (peer.inboundAt === null || peer.inboundAt < this.now() - age) &&
+            /API timeout \(5s\)|\b(?:ECONNREFUSED|ECONNRESET|EHOSTUNREACH|ENETUNREACH|ETIMEDOUT|EPIPE)\b|^HTTP 5\d\d$/.test(result.error || "");
+    }
+
+    private async trySelfRecovery(peer: Peer): Promise<void> {
+        if (!this.config().remoteManagementEnabled || !this.config().remoteAutoRestart || !this.restartSupported() ||
+            this.restartTimer || !this.reverseFailure(peer)) {
+            return;
+        }
+        const evidence = peer.reverseEvidence.filter(item => this.now() - item.at <= 120000);
+        if (evidence.length !== 3 || evidence[2].at - evidence[0].at < 55000) {
+            return;
+        }
+        if (this.hasActiveStream()) {
+            peer.recovery = "録画・視聴が継続中のため再起動を保留しています";
+            return;
+        }
+        try {
+            const config = this.config();
+            if (config.allowIPv4CidrRanges || config.allowIPv6CidrRanges) {
+                const addresses = await hostAddresses(peer.host);
+                if (!addresses.length || addresses.some(address => !isPermittedIPAddress(address, {
+                    ...config, allowIPv4CidrRanges: config.allowIPv4CidrRanges || [],
+                    allowIPv6CidrRanges: config.allowIPv6CidrRanges || []
+                }))) {
+                    peer.recovery = "親機のIPが通常APIの許可範囲に含まれていないため再起動しません";
+                    return;
+                }
+            }
+            if (!this.started || this.restartTimer || !this.reverseFailure(peer)) {
+                return;
+            }
+            this.scheduleRestart(peer, `remote逆方向API通信失敗: ${peer.name}`, [`api:${peer.id}`],
+                () => this.reverseFailure(peer));
+        } catch (error) {
+            peer.recovery = error.message;
+        }
+    }
+
+    private scheduleRestart(peer: Peer, reason: string, subjects: string[], valid = () => true): void {
+        this.recovery.ensureAvailable();
+        peer.recovery = "再起動待ち";
+        this.restartTimer = setTimeout(() => {
+            this.restartTimer = undefined;
+            if (!this.started || !this.config().remoteManagementEnabled || !this.config().remoteAutoRestart ||
+                !this.restartSupported() || !valid()) {
+                peer.recovery = "状態または設定が変わったため再起動を取り消しました";
+                return;
+            }
+            if (this.hasActiveStream()) {
+                peer.recovery = "録画・視聴が開始されたため再起動を保留しています";
+                return;
+            }
+            try {
+                this.recovery.reserve(reason, subjects);
+                this.restart();
+            } catch (error) {
+                peer.recovery = error.message;
+                log.warn("Remote automatic restart was deferred: %s", error.message);
+            }
+        }, 1000);
     }
 
     private tick(): void {
@@ -364,8 +525,14 @@ export class RemoteManager {
                 !health.enabled ? "相手の接続管理がOFFです" : !health.registered ? "相手に自機が登録されていません" :
                     health.role !== (peer.role === "child" ? "parent" : "child") ? "相手側の親機・子機設定が一致しません" : null;
             peer.lastSuccess = this.now();
+            peer.resultAt = this.now();
+            peer.sequence++;
+            const newObservation = this.observeReverse(peer, health);
             peer.remoteRecovery = health.recovery;
             peer.lastRequest = health.lastRequest;
+            if (newObservation) {
+                await this.trySelfRecovery(peer);
+            }
             if (peer.alert) {
                 peer.alert = false;
                 this.notify(peer, "API通信が回復しました");
@@ -385,7 +552,11 @@ export class RemoteManager {
                 return;
             }
             peer.failures++;
-            peer.error = String(error.message || "API request failed");
+            peer.resultAt = this.now();
+            peer.sequence++;
+            peer.reverseEvidence = [];
+            peer.reverseHealthySince = undefined;
+            peer.error = String(error.code ? `${error.code}: ${error.message}` : error.message || "API request failed");
             peer.state = /HTTP (400|401|403)/.test(peer.error) ? "error" : peer.failures >= 3 ? "offline" : "suspect";
             if (peer.failures >= 3) {
                 peer.ping = await this.ping(peer.host) ? "ok" : "failed";
@@ -395,7 +566,10 @@ export class RemoteManager {
                 }
             }
         } finally {
-            peer.nextCheck = this.now() + (peer.state === "online" && !peer.error && this.now() >= peer.graceUntil ? 300000 : 30000);
+            const reverse = this.reverseStatus(peer);
+            const reverseFailed = ["suspect", "offline", "error", "stale"].includes(reverse.state);
+            peer.nextCheck = this.now() + (peer.state === "online" && !peer.error && !reverseFailed &&
+                this.now() >= peer.graceUntil ? 300000 : 30000);
         }
     }
 
@@ -430,7 +604,10 @@ export class RemoteManager {
             return;
         }
         const content = ["Mirakurun Remote", peer.name, `${peer.host}:${peer.port || 40772}`, message,
-            `最終正常応答: ${peer.lastSuccess ? new Date(peer.lastSuccess).toISOString() : "未確認"}`,
+            `最終正常応答: ${peer.lastSuccess ? new Intl.DateTimeFormat("ja-JP", {
+                timeZone: "Asia/Tokyo", year: "numeric", month: "2-digit", day: "2-digit",
+                hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23"
+            }).format(peer.lastSuccess) + " JST" : "未確認"}`,
             `API: ${peer.error || "正常"} / ping: ${peer.ping}`].join("\n").slice(0, 1900);
         this.notificationQueue = this.notificationQueue.then(async () => {
             if (!this.started) {

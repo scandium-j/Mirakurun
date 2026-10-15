@@ -63,6 +63,84 @@ definitions:
             reason:
               type: string
 
+  RemoteDirectionStatus:
+    type: object
+    properties:
+      state:
+        type: string
+        enum: [unknown, online, suspect, offline, error, stale]
+      checkedAt:
+        type: number
+        x-nullable: true
+      lastSuccess:
+        type: number
+        x-nullable: true
+      failures:
+        type: integer
+      error:
+        type: string
+        x-nullable: true
+
+  RemoteHealthObservation:
+    type: object
+    required: [instanceId, sequence, ageMs, successAgeMs, state, failures, error]
+    properties:
+      instanceId:
+        type: string
+      sequence:
+        type: integer
+        minimum: 1
+      ageMs:
+        type: number
+        minimum: 0
+      successAgeMs:
+        type: number
+        x-nullable: true
+      state:
+        type: string
+        enum: [unknown, online, suspect, offline, error]
+      failures:
+        type: integer
+        minimum: 0
+      error:
+        type: string
+        x-nullable: true
+
+  RemoteHealth:
+    type: object
+    properties:
+      protocol:
+        type: integer
+      enabled:
+        type: boolean
+      registered:
+        type: boolean
+      role:
+        type: string
+        enum: [parent, child]
+      checkedAt:
+        type: number
+        x-nullable: true
+      lastSuccess:
+        type: number
+        x-nullable: true
+      state:
+        type: string
+        enum: [unknown, online, suspect, offline, error]
+      observation:
+        $ref: '#/definitions/RemoteHealthObservation'
+      recovery:
+        $ref: '#/definitions/RemoteRecoveryStatus'
+      lastRequest:
+        type: object
+        properties:
+          id:
+            type: string
+          stage:
+            type: string
+          at:
+            type: number
+
   RemotePeerStatus:
     allOf:
       - $ref: '#/definitions/RemoteMirakurun'
@@ -71,6 +149,11 @@ definitions:
           state:
             type: string
             enum: [unknown, online, suspect, offline, error]
+          connectionState:
+            type: string
+            enum: [online, outgoing-error, incoming-error, both-error, unknown, stale, error]
+          reverse:
+            $ref: '#/definitions/RemoteDirectionStatus'
           checkedAt:
             type: number
             x-nullable: true

@@ -116,6 +116,8 @@ describe("Remote monitoring", () => {
         await manager.notificationQueue;
         assert.equal(notices.length, 2);
         assert.deepEqual(notices[0].allowed_mentions, { parse: [] });
+        assert.match(notices[1].content, /最終正常応答: 1970\/01\/01 09:19:10 JST/);
+        assert.doesNotMatch(notices[1].content, /T00:19:10.*Z/);
     });
     it("counts at most one stream failure per peer per 30 seconds", async t => {
         environment(t);
