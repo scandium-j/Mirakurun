@@ -303,10 +303,8 @@ export class RemoteManager {
         if (!observation) {
             return { state: "unknown", checkedAt: null, lastSuccess: null, failures: 0, error: null };
         }
-        // Use durations to avoid depending on synchronized clocks between machines.
-        const age = observation.ageMs + Math.max(0, this.now() - peer.observationReceivedAt);
         return {
-            state: age > RemoteManager.RESULT_FRESHNESS ? "stale" : observation.state,
+            state: observation.state,
             checkedAt: peer.observationReceivedAt - observation.ageMs,
             lastSuccess: observation.successAgeMs === null ? null : peer.observationReceivedAt - observation.successAgeMs,
             failures: observation.failures, error: observation.error
@@ -314,7 +312,7 @@ export class RemoteManager {
     }
 
     private connectionState(peer: Peer, reverse: RemoteDirectionStatus): RemotePeerStatus["connectionState"] {
-        const outgoing = peer.resultAt !== undefined && this.now() - peer.resultAt > RemoteManager.RESULT_FRESHNESS ? "stale" : peer.state;
+        const outgoing = peer.state;
         if (outgoing === "error" || (outgoing === "online" && peer.error) || reverse.state === "error" ||
             (reverse.state === "online" && reverse.error)) {
             return "error";
@@ -323,9 +321,6 @@ export class RemoteManager {
         const incomingFailed = reverse.state === "offline" || reverse.state === "suspect";
         if (outgoingFailed || incomingFailed) {
             return outgoingFailed && incomingFailed ? "both-error" : outgoingFailed ? "outgoing-error" : "incoming-error";
-        }
-        if (reverse.state === "stale" || outgoing === "stale") {
-            return "stale";
         }
         return outgoing === "online" && reverse.state === "online" ? "online" : "unknown";
     }
@@ -566,10 +561,19 @@ export class RemoteManager {
                 }
             }
         } finally {
+            const now = this.now();
             const reverse = this.reverseStatus(peer);
-            const reverseFailed = ["suspect", "offline", "error", "stale"].includes(reverse.state);
-            peer.nextCheck = this.now() + (peer.state === "online" && !peer.error && !reverseFailed &&
-                this.now() >= peer.graceUntil ? 300000 : 30000);
+            const reverseFailed = ["suspect", "offline", "error"].includes(reverse.state);
+            let interval = 30000;
+            if (peer.state === "online" && !peer.error && !reverseFailed && now >= peer.graceUntil) {
+                interval = 300000;
+                if (peer.observation) {
+                    // Refresh before the remote result expires, allowing for the two polling schedules to differ.
+                    const age = peer.observation.ageMs + Math.max(0, now - peer.observationReceivedAt);
+                    interval = Math.max(30000, Math.min(interval, RemoteManager.RESULT_FRESHNESS - age - 30000));
+                }
+            }
+            peer.nextCheck = now + interval;
         }
     }
 

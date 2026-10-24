@@ -47,11 +47,12 @@ function fixture(t, options = {}) {
         observation(value) { observation = { ...observation, ...value }; },
         health(value) { health = { ...health, ...value }; },
         fail(value) { failOutgoing = value; },
+        advance(delta) { now += delta; },
         async check(delta = 30000) { now += delta; await manager.check("peer"); } };
 }
 
 describe("Remote direction monitoring", () => {
-    it("distinguishes healthy, one-way, both-way, configuration, unknown and stale results without feedback loops", async t => {
+    it("distinguishes measured healthy, one-way, both-way, configuration and unknown results without feedback loops", async t => {
         const f = fixture(t, { settings: { remoteAutoRestart: false },
             observation: { state: "online", failures: 0, error: null, successAgeMs: 0 } });
         await f.manager.check("peer");
@@ -75,7 +76,7 @@ describe("Remote direction monitoring", () => {
         assert.equal(f.manager.status().peers[0].connectionState, "unknown");
         f.observation({ state: "online", failures: 0, error: null, ageMs: 360001, successAgeMs: 360001 });
         await f.check();
-        assert.equal(f.manager.status().peers[0].connectionState, "stale");
+        assert.equal(f.manager.status().peers[0].connectionState, "online");
         f.fail(true);
         await f.check();
         assert.equal(f.manager.status().peers[0].connectionState, "outgoing-error");
@@ -85,8 +86,10 @@ describe("Remote direction monitoring", () => {
     it("does not refresh repeated observations or mistake old peers for bidirectionally healthy ones", async t => {
         const f = fixture(t, { observation: { sequence: 1, state: "online", failures: 0, error: null } });
         await f.manager.check("peer");
+        const original = f.manager.status().peers[0].reverse;
         await f.check(360001);
-        assert.equal(f.manager.status().peers[0].reverse.state, "stale");
+        assert.deepEqual(f.manager.status().peers[0].reverse, original, "repeated reports keep their original times and state");
+        assert.equal(f.manager.peers.get("peer").nextCheck - f.now, 30000, "expired reports are retried without refreshing their age");
         f.observation({ sequence: 2, successAgeMs: undefined });
         await f.check();
         assert.equal(f.manager.status().peers[0].reverse.state, "unknown", "missing observation fields are not assumed healthy");
@@ -100,6 +103,93 @@ describe("Remote direction monitoring", () => {
         f.observation({ state: "online", failures: 0, error: null, successAgeMs: 0 });
         await f.check();
         assert.equal(f.manager.peers.get("peer").nextCheck - f.now, 300000);
+    });
+
+    it("keeps measured normal and failed states and success times until the next result", async t => {
+        const f = fixture(t, { settings: { remoteAutoRestart: false },
+            observation: { state: "online", failures: 0, error: null, successAgeMs: 0 } });
+        assert.equal(f.manager.status().peers[0].connectionState, "unknown", "the initial check is still pending");
+        await f.manager.check("peer");
+        const original = f.manager.status().peers[0];
+        f.advance(360001);
+        assert.deepEqual(f.manager.status().peers[0], original, "time alone changes neither state nor timestamps");
+        f.observation({ state: "offline", failures: 3, error: "API timeout (5s)", successAgeMs: 30000 });
+        await f.check(0);
+        assert.equal(f.manager.status().peers[0].connectionState, "incoming-error");
+        const failed = f.manager.status().peers[0];
+        f.advance(360001);
+        assert.deepEqual(f.manager.status().peers[0], failed, "incoming failures do not expire into an unknown state");
+        f.fail(true);
+        await f.check(0);
+        assert.equal(f.manager.status().peers[0].connectionState, "both-error");
+        const bothFailed = f.manager.status().peers[0];
+        f.advance(360001);
+        assert.deepEqual(f.manager.status().peers[0], bothFailed, "outgoing failures also retain their measured state");
+        f.fail(false);
+        f.observation({ state: "online", failures: 0, error: null, successAgeMs: 0 });
+        await f.check(0);
+        assert.equal(f.manager.status().peers[0].connectionState, "online", "new successful checks clear the failure display");
+    });
+
+    it("refreshes aged results early while preserving the thirty-second request limit", async t => {
+        const f = fixture(t, { settings: { remoteAutoRestart: false },
+            observation: { sequence: 1, state: "online", failures: 0, error: null, ageMs: 240000, successAgeMs: 240000 } });
+        await f.manager.check("peer");
+        assert.equal(f.manager.peers.get("peer").nextCheck - f.now, 90000);
+        const receivedAt = f.manager.peers.get("peer").observationReceivedAt;
+        await f.check(60000);
+        assert.equal(f.manager.peers.get("peer").nextCheck - f.now, 30000);
+        assert.equal(f.manager.peers.get("peer").observationReceivedAt, receivedAt, "a repeated result is not treated as a new check");
+        const checkedAt = f.manager.status().peers[0].checkedAt;
+        await f.check(29999);
+        assert.equal(f.manager.status().peers[0].checkedAt, checkedAt, "manual checks cannot bypass throttling");
+        await f.check(1);
+        assert.equal(f.manager.status().peers[0].checkedAt, f.now);
+    });
+
+    it("keeps two healthy peers' observations fresh when their check schedules differ by four minutes", async t => {
+        const directory = fs.mkdtempSync(path.join(os.tmpdir(), "mirakurun-phase-"));
+        const previousPath = process.env.SERVER_CONFIG_PATH;
+        process.env.SERVER_CONFIG_PATH = path.join(directory, "config", "server.yml");
+        let now = 1000000;
+        const settings = ["child", "parent"].map(role => ({ remoteManagementEnabled: false, remoteAutoRestart: false,
+            remoteMirakuruns: [{ id: "peer", name: role, role, host: "127.0.0.1", port: 40772 }] }));
+        const requests = [[], []];
+        const managers = settings.map((config, index) => new RemoteManager(() => config, () => now, async () => {
+            requests[index].push(now);
+            return managers[1 - index].health("127.0.0.1");
+        }));
+        t.after(async () => {
+            await Promise.all(managers.map(manager => manager.stop()));
+            if (previousPath === undefined) delete process.env.SERVER_CONFIG_PATH;
+            else process.env.SERVER_CONFIG_PATH = previousPath;
+            fs.rmSync(directory, { recursive: true, force: true });
+        });
+        managers.forEach(manager => manager.start());
+        settings.forEach(config => { config.remoteManagementEnabled = true; });
+        await managers[0].check("peer");
+        now += 240000;
+        await managers[1].check("peer");
+        assert.equal(managers[1].peers.get("peer").nextCheck - now, 90000, "the four-minute-old result does not cause another five-minute wait");
+        for (let second = 0; second < 1200; second++) {
+            now += 1000;
+            managers.forEach(manager => manager.tick());
+            await Promise.all(managers.map(manager => manager.peers.get("peer").pending));
+            for (const manager of managers) {
+                const peer = manager.peers.get("peer");
+                if (peer.observation) {
+                    assert.ok(peer.observation.ageMs + now - peer.observationReceivedAt < 360000, "healthy peers refresh before expiry");
+                    assert.equal(manager.status().peers[0].connectionState, "online");
+                }
+            }
+        }
+        for (const times of requests) {
+            assert.ok(times.length > 3);
+            for (let i = 1; i < times.length; i++) {
+                assert.ok(times[i] - times[i - 1] >= 30000, "polling never exceeds the thirty-second request limit");
+                assert.ok(times[i] - times[i - 1] <= 300000, "normal polling waits at most five minutes");
+            }
+        }
     });
 });
 

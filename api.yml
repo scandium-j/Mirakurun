@@ -68,7 +68,7 @@ definitions:
     properties:
       state:
         type: string
-        enum: [unknown, online, suspect, offline, error, stale]
+        enum: [unknown, online, suspect, offline, error]
       checkedAt:
         type: number
         x-nullable: true
@@ -151,7 +151,7 @@ definitions:
             enum: [unknown, online, suspect, offline, error]
           connectionState:
             type: string
-            enum: [online, outgoing-error, incoming-error, both-error, unknown, stale, error]
+            enum: [online, outgoing-error, incoming-error, both-error, unknown, error]
           reverse:
             $ref: '#/definitions/RemoteDirectionStatus'
           checkedAt:

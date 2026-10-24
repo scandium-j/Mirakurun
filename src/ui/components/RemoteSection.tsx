@@ -14,14 +14,13 @@ import { state } from "../modules/state";
 import "./RemoteSection.sass";
 
 const labels = { unknown: "未確認", online: "正常", suspect: "再確認中", offline: "応答なし", error: "設定エラー",
-    stale: "結果が古い", idle: "未使用", starting: "開始待ち", receiving: "受信中", failed: "失敗" };
+    idle: "未使用", starting: "開始待ち", receiving: "受信中", failed: "失敗" };
 const connectionLabels = {
     online: "双方向: 正常",
     "outgoing-error": "接続: 自分→相手に異常",
     "incoming-error": "接続: 相手→自分に異常",
     "both-error": "接続: 双方向に異常",
     unknown: "接続: 未確認",
-    stale: "接続: 結果が古い",
     error: "接続: 設定エラー"
 };
 const time = (value?: number) => value ? DateTime.fromMillis(value).setZone("Asia/Tokyo").setLocale("ja").toFormat("MM/dd HH:mm:ss") : "未確認";
@@ -118,13 +117,13 @@ export const RemoteSection: React.FC = () => {
         {status?.peers.map(peer => <div className="remote-machine" key={peer.id}>
             <div className="remote-toolbar">
                 <strong>{peer.name}</strong><Tag>{peer.role === "child" ? "子機" : "親機"}</Tag>
-                <Tag intent={peer.connectionState === "online" ? "success" : peer.connectionState === "error" || peer.connectionState === "outgoing-error" || peer.connectionState === "incoming-error" || peer.connectionState === "both-error" ? "danger" : peer.connectionState === "stale" ? "warning" : "none"}>
+                <Tag intent={peer.connectionState === "online" ? "success" : peer.connectionState === "error" || peer.connectionState === "outgoing-error" || peer.connectionState === "incoming-error" || peer.connectionState === "both-error" ? "danger" : "none"}>
                     {connectionLabels[peer.connectionState || "unknown"]}
                 </Tag>
                 <Tag intent={peer.state === "online" ? "success" : peer.state === "offline" || peer.state === "error" ? "danger" : "none"}>
                     自分→相手: {labels[peer.state]}
                 </Tag>
-                <Tag intent={peer.reverse?.state === "online" ? "success" : peer.reverse?.state === "offline" || peer.reverse?.state === "error" ? "danger" : peer.reverse?.state === "stale" ? "warning" : "none"}>
+                <Tag intent={peer.reverse?.state === "online" ? "success" : peer.reverse?.state === "offline" || peer.reverse?.state === "error" ? "danger" : "none"}>
                     相手→自分: {labels[peer.reverse?.state || "unknown"]}
                 </Tag>
                 {peer.role === "child" && <Tag>配信: {labels[peer.streamState]}</Tag>}

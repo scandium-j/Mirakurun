@@ -272,7 +272,7 @@ export interface RemoteMirakurun {
 export type RemoteCheckState = "unknown" | "online" | "suspect" | "offline" | "error";
 
 export interface RemoteDirectionStatus {
-    state: RemoteCheckState | "stale";
+    state: RemoteCheckState;
     checkedAt: number | null;
     lastSuccess: number | null;
     failures: number;
@@ -305,7 +305,7 @@ export interface RemoteHealth {
 
 export interface RemotePeerStatus extends RemoteMirakurun {
     state: RemoteCheckState;
-    connectionState?: "online" | "outgoing-error" | "incoming-error" | "both-error" | "unknown" | "stale" | "error";
+    connectionState?: "online" | "outgoing-error" | "incoming-error" | "both-error" | "unknown" | "error";
     reverse?: RemoteDirectionStatus;
     checkedAt: number | null;
     lastSuccess: number | null;
